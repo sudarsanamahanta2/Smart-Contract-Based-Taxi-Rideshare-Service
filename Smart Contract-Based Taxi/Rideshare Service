@@ -1,0 +1,280 @@
+// Smart Contract-Based Taxi/Rideshare Service/Project.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+contract TaxiRideshareService {
+    // State variables
+    address public owner;
+    uint256 public rideCounter;
+    uint256 public constant BASE_FARE = 0.001 ether; // Base fare in wei
+    uint256 public constant FARE_PER_KM = 0.0001 ether; // Fare per kilometer
+    
+    // Enums
+    enum RideStatus { 
+        Requested, 
+        Accepted, 
+        InProgress, 
+        Completed, 
+        Cancelled 
+    }
+    
+    // Structs
+    struct Driver {
+        address driverAddress;
+        string name;
+        string vehicleInfo;
+        uint256 rating; // Rating out of 500 (5.00 * 100 for precision)
+        uint256 totalRides;
+        bool isActive;
+        bool isRegistered;
+    }
+    
+    struct Rider {
+        address riderAddress;
+        string name;
+        uint256 rating; // Rating out of 500
+        uint256 totalRides;
+        bool isRegistered;
+    }
+    
+    struct Ride {
+        uint256 rideId;
+        address rider;
+        address driver;
+        string pickupLocation;
+        string destination;
+        uint256 distance; // in kilometers
+        uint256 fare;
+        RideStatus status;
+        uint256 timestamp;
+        bool riderRated;
+        bool driverRated;
+    }
+    
+    // Mappings
+    mapping(address => Driver) public drivers;
+    mapping(address => Rider) public riders;
+    mapping(uint256 => Ride) public rides;
+    mapping(address => uint256[]) public riderRideHistory;
+    mapping(address => uint256[]) public driverRideHistory;
+    
+    // Events
+    event RideRequested(uint256 indexed rideId, address indexed rider, string pickupLocation, string destination);
+    event RideAccepted(uint256 indexed rideId, address indexed driver);
+    event RideStarted(uint256 indexed rideId);
+    event RideCompleted(uint256 indexed rideId, uint256 fare);
+    event RideCancelled(uint256 indexed rideId, string reason);
+    event DriverRegistered(address indexed driver, string name);
+    event RiderRegistered(address indexed rider, string name);
+    event RatingGiven(uint256 indexed rideId, address indexed ratedBy, address indexed ratedTo, uint256 rating);
+    
+    // Modifiers
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function");
+        _;
+    }
+    
+    modifier onlyRegisteredDriver() {
+        require(drivers[msg.sender].isRegistered, "Driver not registered");
+        _;
+    }
+    
+    modifier onlyRegisteredRider() {
+        require(riders[msg.sender].isRegistered, "Rider not registered");
+        _;
+    }
+    
+    modifier validRide(uint256 _rideId) {
+        require(_rideId > 0 && _rideId <= rideCounter, "Invalid ride ID");
+        _;
+    }
+    
+    constructor() {
+        owner = msg.sender;
+        rideCounter = 0;
+    }
+    
+    // Core Function 1: Request Ride
+    function requestRide(
+        string memory _pickupLocation, 
+        string memory _destination, 
+        uint256 _distance
+    ) external onlyRegisteredRider returns (uint256) {
+        require(bytes(_pickupLocation).length > 0, "Pickup location cannot be empty");
+        require(bytes(_destination).length > 0, "Destination cannot be empty");
+        require(_distance > 0, "Distance must be greater than 0");
+        
+        rideCounter++;
+        uint256 calculatedFare = BASE_FARE + (FARE_PER_KM * _distance);
+        
+        rides[rideCounter] = Ride({
+            rideId: rideCounter,
+            rider: msg.sender,
+            driver: address(0),
+            pickupLocation: _pickupLocation,
+            destination: _destination,
+            distance: _distance,
+            fare: calculatedFare,
+            status: RideStatus.Requested,
+            timestamp: block.timestamp,
+            riderRated: false,
+            driverRated: false
+        });
+        
+        riderRideHistory[msg.sender].push(rideCounter);
+        
+        emit RideRequested(rideCounter, msg.sender, _pickupLocation, _destination);
+        return rideCounter;
+    }
+    
+    // Core Function 2: Accept and Complete Ride
+    function acceptRide(uint256 _rideId) external onlyRegisteredDriver validRide(_rideId) {
+        Ride storage ride = rides[_rideId];
+        require(ride.status == RideStatus.Requested, "Ride is not available");
+        require(drivers[msg.sender].isActive, "Driver is not active");
+        
+        ride.driver = msg.sender;
+        ride.status = RideStatus.Accepted;
+        
+        driverRideHistory[msg.sender].push(_rideId);
+        
+        emit RideAccepted(_rideId, msg.sender);
+    }
+    
+    function startRide(uint256 _rideId) external validRide(_rideId) {
+        Ride storage ride = rides[_rideId];
+        require(msg.sender == ride.driver, "Only assigned driver can start ride");
+        require(ride.status == RideStatus.Accepted, "Ride must be accepted first");
+        
+        ride.status = RideStatus.InProgress;
+        emit RideStarted(_rideId);
+    }
+    
+    function completeRide(uint256 _rideId) external payable validRide(_rideId) {
+        Ride storage ride = rides[_rideId];
+        require(msg.sender == ride.rider, "Only rider can complete and pay for ride");
+        require(ride.status == RideStatus.InProgress, "Ride must be in progress");
+        require(msg.value >= ride.fare, "Insufficient payment");
+        
+        ride.status = RideStatus.Completed;
+        
+        // Transfer payment to driver (95% of fare, 5% platform fee)
+        uint256 driverPayment = (ride.fare * 95) / 100;
+        uint256 platformFee = ride.fare - driverPayment;
+        
+        payable(ride.driver).transfer(driverPayment);
+        payable(owner).transfer(platformFee);
+        
+        // Refund excess payment
+        if (msg.value > ride.fare) {
+            payable(msg.sender).transfer(msg.value - ride.fare);
+        }
+        
+        // Update ride counts
+        riders[ride.rider].totalRides++;
+        drivers[ride.driver].totalRides++;
+        
+        emit RideCompleted(_rideId, ride.fare);
+    }
+    
+    // Core Function 3: Rate and Manage Users
+    function rateUser(uint256 _rideId, uint256 _rating, bool _isRatingDriver) external validRide(_rideId) {
+        require(_rating >= 100 && _rating <= 500, "Rating must be between 1.00 and 5.00 (100-500)");
+        
+        Ride storage ride = rides[_rideId];
+        require(ride.status == RideStatus.Completed, "Ride must be completed");
+        
+        if (_isRatingDriver) {
+            require(msg.sender == ride.rider, "Only rider can rate driver");
+            require(!ride.driverRated, "Driver already rated for this ride");
+            
+            Driver storage driver = drivers[ride.driver];
+            uint256 totalRating = (driver.rating * driver.totalRides) + _rating;
+            driver.rating = totalRating / (driver.totalRides + 1);
+            ride.driverRated = true;
+            
+            emit RatingGiven(_rideId, msg.sender, ride.driver, _rating);
+        } else {
+            require(msg.sender == ride.driver, "Only driver can rate rider");
+            require(!ride.riderRated, "Rider already rated for this ride");
+            
+            Rider storage rider = riders[ride.rider];
+            uint256 totalRating = (rider.rating * rider.totalRides) + _rating;
+            rider.rating = totalRating / (rider.totalRides + 1);
+            ride.riderRated = true;
+            
+            emit RatingGiven(_rideId, msg.sender, ride.rider, _rating);
+        }
+    }
+    
+    // Registration functions
+    function registerDriver(string memory _name, string memory _vehicleInfo) external {
+        require(!drivers[msg.sender].isRegistered, "Driver already registered");
+        require(bytes(_name).length > 0, "Name cannot be empty");
+        require(bytes(_vehicleInfo).length > 0, "Vehicle info cannot be empty");
+        
+        drivers[msg.sender] = Driver({
+            driverAddress: msg.sender,
+            name: _name,
+            vehicleInfo: _vehicleInfo,
+            rating: 400, // Start with 4.00 rating
+            totalRides: 0,
+            isActive: true,
+            isRegistered: true
+        });
+        
+        emit DriverRegistered(msg.sender, _name);
+    }
+    
+    function registerRider(string memory _name) external {
+        require(!riders[msg.sender].isRegistered, "Rider already registered");
+        require(bytes(_name).length > 0, "Name cannot be empty");
+        
+        riders[msg.sender] = Rider({
+            riderAddress: msg.sender,
+            name: _name,
+            rating: 400, // Start with 4.00 rating
+            totalRides: 0,
+            isRegistered: true
+        });
+        
+        emit RiderRegistered(msg.sender, _name);
+    }
+    
+    // Utility functions
+    function cancelRide(uint256 _rideId, string memory _reason) external validRide(_rideId) {
+        Ride storage ride = rides[_rideId];
+        require(
+            msg.sender == ride.rider || msg.sender == ride.driver,
+            "Only rider or driver can cancel"
+        );
+        require(
+            ride.status == RideStatus.Requested || ride.status == RideStatus.Accepted,
+            "Cannot cancel ride in progress or completed"
+        );
+        
+        ride.status = RideStatus.Cancelled;
+        emit RideCancelled(_rideId, _reason);
+    }
+    
+    function toggleDriverStatus() external onlyRegisteredDriver {
+        drivers[msg.sender].isActive = !drivers[msg.sender].isActive;
+    }
+    
+    function getRideDetails(uint256 _rideId) external view validRide(_rideId) returns (Ride memory) {
+        return rides[_rideId];
+    }
+    
+    function getRiderHistory(address _rider) external view returns (uint256[] memory) {
+        return riderRideHistory[_rider];
+    }
+    
+    function getDriverHistory(address _driver) external view returns (uint256[] memory) {
+        return driverRideHistory[_driver];
+    }
+    
+    // Emergency function
+    function emergencyWithdraw() external onlyOwner {
+        payable(owner).transfer(address(this).balance);
+    }
+}
